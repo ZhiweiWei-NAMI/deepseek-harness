@@ -38,6 +38,8 @@ interface EventWindowLeaf {
   readonly kind: 'leaf'
   readonly entries: readonly SessionEventLikeEntry[]
   readonly length: number
+  readonly hasTransients: boolean
+  readonly tailSeq: number
 }
 
 interface EventWindowConcat {
@@ -45,16 +47,26 @@ interface EventWindowConcat {
   readonly left: EventWindowNode
   readonly right: EventWindowNode
   readonly length: number
+  readonly hasTransients: boolean
+  readonly tailSeq: number
 }
 
 type EventWindowNode = EventWindowLeaf | EventWindowConcat
 
 function leaf(entries: readonly SessionEventLikeEntry[]): EventWindowLeaf {
-  return { kind: 'leaf', entries, length: entries.length }
+  return {
+    kind: 'leaf', entries, length: entries.length,
+    hasTransients: entries.some(entry => entry.type === 'transient'),
+    tailSeq: entries.at(-1)?.event.seq ?? -Infinity,
+  }
 }
 
 function concat(left: EventWindowNode, right: EventWindowNode): EventWindowConcat {
-  return { kind: 'concat', left, right, length: left.length + right.length }
+  return {
+    kind: 'concat', left, right, length: left.length + right.length,
+    hasTransients: left.hasTransients || right.hasTransients,
+    tailSeq: right.length > 0 ? right.tailSeq : left.tailSeq,
+  }
 }
 
 function materialize(node: EventWindowNode): readonly SessionEventLikeEntry[] {
@@ -175,11 +187,14 @@ export class MutableSessionEventSource implements SessionEventSource {
 
   /**
    * Replace one attempt's transient rows with its committed durable settlement.
+   * Tail settlement without transient rows does not materialize the event window.
    * @param attemptId - process-local attempt whose live rows are now redundant.
    * @param entry - durable settlement committed for that attempt.
    */
   settleAssistant(attemptId: LlmAttemptId, entry?: SessionAssistantSettlementEntry): void {
-    const entries = materialize(this.window).filter(candidate => (
+    const appendOnly = !this.window.hasTransients
+      && (entry === undefined || entry.event.seq > this.window.tailSeq)
+    const entries = appendOnly ? [] : materialize(this.window).filter(candidate => (
       candidate.type !== 'transient' || candidate.event.data.attemptId !== attemptId
     ))
     if (entry !== undefined) {
@@ -187,7 +202,9 @@ export class MutableSessionEventSource implements SessionEventSource {
       if (index < 0) entries.push(entry)
       else entries.splice(index, 0, entry)
     }
-    this.window = leaf(entries)
+    this.window = appendOnly
+      ? (entry === undefined ? this.window : concat(this.window, leaf(entries)))
+      : leaf(entries)
     this.publish(this.snapshot.hasMore, {
       kind: 'settle-assistant',
       attemptId,

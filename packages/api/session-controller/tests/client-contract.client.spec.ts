@@ -137,6 +137,23 @@ describe('Client Session contracts', () => {
     expect(iterate).toHaveBeenCalledOnce()
   })
 
+  it.each([undefined, assistantSettlement(SessionSeq(3))])('settles without scanning absent live rows (%j)', (settlement) => {
+    const feed = new MutableSessionEventSource()
+    const base = [entry(SessionSeq(1))]
+    const iterate = vi.fn(Array.prototype[Symbol.iterator].bind(base))
+    Object.defineProperty(base, Symbol.iterator, { value: iterate })
+    feed.prepend(base, false)
+    feed.append(entry(SessionSeq(2)))
+    const before = feed.getSnapshot()
+    feed.settleAssistant(LlmAttemptId('empty'), settlement)
+    const after = feed.getSnapshot()
+    expect(iterate).not.toHaveBeenCalled()
+    expect(after.change).toEqual({ kind: 'settle-assistant', attemptId: 'empty', ...(settlement ? { entry: settlement } : {}) })
+    expect(after.revision).toBe(before.revision + 1)
+    expect(before.entries).toEqual([base[0], entry(SessionSeq(2))])
+    expect(after.entries).toEqual([...before.entries, ...(settlement ? [settlement] : [])])
+  })
+
   it('publishes one exact Assistant settlement delta after retiring its transient rows', () => {
     const feed = new MutableSessionEventSource()
     const opening = entry(SessionSeq(1))
